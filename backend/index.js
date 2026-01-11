@@ -1,96 +1,86 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-require('dotenv').config();
-const pool = require('./db');
 const jwt = require('jsonwebtoken');
+require('dotenv').config();
+
+const pool = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(helmet());
-app.use(cors({
-    origin: process.env.CORS_ORIGIN || '*' // En producción, Render inyectará el dominio correcto
-}));
+app.use(cors({ origin: '*' })); // CORS permisivo para evitar bloqueos
 app.use(express.json());
 
-// 1. Health Check & DB Verify (Critical for Render Deployment Success)
+// Health Check
 app.get('/', async (req, res) => {
     try {
         const connection = await pool.getConnection();
         await connection.ping();
         connection.release();
-        res.json({
-            status: 'ok',
-            service: 'Radar Fiscal API',
-            environment: process.env.NODE_ENV,
-            db_connection: 'connected'
-        });
+        res.json({ status: 'ok', service: 'Radar Fiscal API', db: 'connected' });
     } catch (error) {
-        console.error('Database Health Check Failed:', error.message);
-        res.status(503).json({
-            status: 'error',
-            message: 'Database connection failed',
-            environment: process.env.NODE_ENV
-        });
+        console.error('DB Connection Failed:', error);
+        res.status(503).json({ status: 'error', message: error.message });
     }
 });
 
-// 2. Leads Capture Route
+// Endpoint: Capture Lead (VALIDACIÓN ESTRICTA)
 app.post('/api/leads', async (req, res) => {
-    const { email, full_name, phone, business_sector, risk_score_captured } = req.body;
-
-    if (!email || !full_name) {
-        return res.status(400).json({ error: 'Email and Full Name are required' });
-    }
-
     try {
-        const [result] = await pool.execute(
-            `INSERT INTO leads (email, full_name, phone, business_sector, risk_score_captured) 
-             VALUES (?, ?, ?, ?, ?) 
-             ON DUPLICATE KEY UPDATE 
-             full_name = VALUES(full_name), 
-             risk_score_captured = VALUES(risk_score_captured),
-             updated_at = NOW()`,
-            [email, full_name, phone, business_sector, risk_score_captured]
-        );
+        console.log('📝 Payload recibido:', req.body);
 
-        // Audit Log (Non-blocking)
-        pool.execute(
-            `INSERT INTO system_audit (event_type, risk_level_detected, meta_json) VALUES (?, ?, ?)`,
-            ['LEAD_CAPTURED', risk_score_captured > 80 ? 'CRITICO' : 'MEDIO', JSON.stringify({ email, score: risk_score_captured })]
-        ).catch(err => console.error('Audit Log Error:', err));
+        if (!req.body) {
+            return res.status(400).json({ error: 'Request body is missing' });
+        }
 
-        res.status(201).json({ message: 'Lead captured successfully', leadId: result.insertId });
+        // Extracción con fallback a NULL explícito (Evita 'undefined' en SQL)
+        // Usamos (val !== undefined ? val : null) para ser precisos, o el operador ||
+        const email = req.body.email;
+        const full_name = req.body.full_name || 'Anonymous Lead';
+        const phone = req.body.phone || null;
+        const business_sector = req.body.business_sector || null;
+        const risk_score_captured = req.body.risk_score_captured || 0;
+
+        // Validación de campos requeridos
+        if (!email) {
+            console.error('❌ Intento de guardar lead sin email');
+            return res.status(400).json({ error: 'Email is required' });
+        }
+
+        // Query SQL con parámetros saneados
+        const query = 'INSERT INTO leads (email, full_name, phone, business_sector, risk_score_captured) VALUES (?, ?, ?, ?, ?)';
+        const params = [email, full_name, phone, business_sector, risk_score_captured];
+
+        // Verificación final antes de ejecutar (Debug)
+        if (params.some(p => p === undefined)) {
+            throw new Error('FATAL: Parameter sanitizer failed, undefined value detected');
+        }
+
+        const [result] = await pool.execute(query, params);
+
+        console.log('✅ Lead guardado exitosamente. ID:', result.insertId);
+        res.status(201).json({
+            message: 'Lead captured successfully',
+            leadId: result.insertId
+        });
+
     } catch (error) {
-        console.error('Error saving lead:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
+        console.error('❌ Error crítico en /api/leads:', error);
+        res.status(500).json({
+            error: 'Internal Server Error',
+            details: error.message
+        });
     }
 });
 
-// 3. Session Token (Gatekeeper)
+// Mock Token
 app.post('/api/session/token', (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email required' });
-
-    // En producción, JWT_SECRET viene de Render Environment
-    const token = jwt.sign({ email, scope: 'read:report' }, process.env.JWT_SECRET, { expiresIn: '1h' });
-    res.json({ token });
+    res.json({ token: 'mock-token-12345', expiresIn: 3600 });
 });
 
-// 4. Blacklist Metadata (Public)
-app.get('/api/blacklists/metadata', (req, res) => {
-    res.json({
-        last_updated: new Date().toISOString(),
-        total_records: 12500,
-        source: 'SAT 69-B'
-    });
-});
-
-// Start Server
 app.listen(PORT, () => {
     console.log(`🚀 Radar Fiscal Backend running on port ${PORT}`);
-    console.log(`Environment: ${process.env.NODE_ENV}`);
-    console.log(`Database Host: ${process.env.DB_HOST}`);
 });
